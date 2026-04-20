@@ -577,6 +577,59 @@ def compute_paired_multi_gpu(king_eval, chall_eval, token_batches):
 
 
 # ---------------------------------------------------------------------------
+# Coherence probe — cheap sanity check before expensive full eval
+# ---------------------------------------------------------------------------
+
+COHERENCE_PROBE_N = 16          # sequences for the probe
+COHERENCE_RATIO_FLOOR = 0.5     # chall gap must be >= king gap * ratio
+COHERENCE_FLOOR_NATS = 0.1      # absolute minimum gap (nats/token)
+COHERENCE_MAX_LOSS = 20.0       # reject if mean loss exceeds this
+
+
+def coherence_probe(king_eval, challenger_eval, sequences, rng):
+    """Quick sanity check: both models should produce sensible losses.
+
+    Picks a small random subset, computes mean losses for each model, and
+    verifies they are finite and not degenerate. Returns
+    (king_gap, chall_gap, ok, reason) where gap = mean_loss - ln(vocab_size)
+    (positive means the model learned *something*).
+    """
+    n = min(COHERENCE_PROBE_N, len(sequences))
+    indices = rng.choice(len(sequences), size=n, replace=False).tolist()
+    probe_seqs = [sequences[i] for i in indices]
+
+    king_losses, chall_losses = compute_paired_multi_gpu(
+        king_eval, challenger_eval, probe_seqs,
+    )
+
+    k_mean = sum(king_losses) / len(king_losses)
+    c_mean = sum(chall_losses) / len(chall_losses)
+
+    # ln(vocab_size) is the loss of a uniform random model.
+    # For typical LLMs vocab ~256k => ln(256000) ≈ 12.45
+    ln_vocab = 12.45
+    king_gap = ln_vocab - k_mean
+    chall_gap = ln_vocab - c_mean
+
+    if not (np.isfinite(k_mean) and np.isfinite(c_mean)):
+        return king_gap, chall_gap, False, "non-finite loss detected"
+
+    if k_mean > COHERENCE_MAX_LOSS:
+        return king_gap, chall_gap, False, f"king loss {k_mean:.2f} exceeds max {COHERENCE_MAX_LOSS}"
+
+    if c_mean > COHERENCE_MAX_LOSS:
+        return king_gap, chall_gap, False, f"challenger loss {c_mean:.2f} exceeds max {COHERENCE_MAX_LOSS}"
+
+    floor = min(king_gap * COHERENCE_RATIO_FLOOR, COHERENCE_FLOOR_NATS)
+    if chall_gap < floor:
+        return king_gap, chall_gap, False, (
+            f"challenger coherence gap {chall_gap:.3f} below floor {floor:.3f}"
+        )
+
+    return king_gap, chall_gap, True, ""
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap test
 # ---------------------------------------------------------------------------
 
