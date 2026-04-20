@@ -384,81 +384,62 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
 # Weight norm guard — reject models with inflated L2 norms
 # ---------------------------------------------------------------------------
 
-NORM_EPSILON = 1e-8
-ZERO_FRAC_TOLERANCE = 0.001  # 0.1% extra exact-zeros over king => suspicious
+NORM_EPSILON = 1e-8  # currently unused; kept as a public constant for downstream scripts
+COHERENCE_FLOOR_NATS = float(os.environ.get("TEUTONIC_COHERENCE_FLOOR_NATS", "1.0"))
+COHERENCE_RATIO_FLOOR = float(os.environ.get("TEUTONIC_COHERENCE_RATIO_FLOOR", "0.5"))
+
 
 @torch.no_grad()
-def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
-    """Compare per-parameter weight statistics between king and challenger.
+def coherence_probe(king_eval, challenger_eval, sequences, rng, n_probe=8):
+    """Behavioral sanity check: a real language model assigns much lower
+    cross-entropy to coherent text than to the same tokens shuffled.
 
-    A challenger fails if any parameter:
+    Picks ``n_probe`` real sequences and constructs a per-sequence
+    token-shuffled version. Computes both models' average per-token CE on
+    the coherent batch and on the shuffled batch. The "coherence gap" is
+    ``CE_shuffled - CE_coherent``; for a healthy Gemma-class LM this is
+    typically 3-5 nats. We require the challenger's gap to be at least
+    ``min(king_gap * COHERENCE_RATIO_FLOOR, COHERENCE_FLOOR_NATS)``.
 
-    * contains non-finite values, or
-    * has an L2 norm that diverges from the king's by more than ``max_ratio``
-      in EITHER direction (over- or under-scaled — both are equally
-      suspicious; an attacker can game eval just as easily by zeroing
-      activations as by exploding them), or
-    * introduces materially more exact-zero entries than the king
-      (typical signature of a hand-crafted "dead" subspace).
+    A challenger that satisfies bootstrap-LCB on shuffled-equivalent or
+    constant-prediction noise will fail here, with no thresholds tuned
+    against weight statistics. The probe is independent of how the model
+    was trained; it asks only "does this object behave as a language
+    model on text it has not seen during fine-tuning?".
 
-    Returns ``(ok, violations)`` where ``violations`` is a list of dicts
-    describing each failing parameter.
+    Returns ``(king_gap, chall_gap, ok, reason)``.
     """
-    king_params = dict(king_model.named_parameters())
-    violations = []
-    inv_max_ratio = 1.0 / max_ratio
+    if len(sequences) == 0:
+        return 0.0, 0.0, True, None
 
-    for c_name, c_param in challenger_model.named_parameters():
-        if not torch.isfinite(c_param.data).all():
-            violations.append({"param": c_name, "reason": "non-finite values"})
-            continue
+    n = min(n_probe, len(sequences))
+    pick = rng.choice(len(sequences), size=n, replace=False)
+    coherent = [sequences[int(i)] for i in pick]
+    shuffled = []
+    for seq in coherent:
+        s = seq.copy()
+        rng.shuffle(s)
+        shuffled.append(s)
 
-        k_param = king_params.get(c_name)
-        if k_param is None:
-            continue
+    same = king_eval is challenger_eval
+    if same:
+        k_co = king_eval.compute_losses(coherent)
+        k_sh = king_eval.compute_losses(shuffled)
+        c_co, c_sh = k_co, k_sh
+    else:
+        k_co, c_co = compute_paired_multi_gpu(king_eval, challenger_eval, coherent)
+        k_sh, c_sh = compute_paired_multi_gpu(king_eval, challenger_eval, shuffled)
 
-        k_data = k_param.data.float()
-        c_data = c_param.data.float()
-        k_norm = torch.linalg.vector_norm(k_data).item()
-        c_norm = torch.linalg.vector_norm(c_data).item()
+    king_gap = float(np.mean(k_sh) - np.mean(k_co))
+    chall_gap = float(np.mean(c_sh) - np.mean(c_co))
 
-        if k_norm < NORM_EPSILON:
-            # King param is itself ~zero; a small absolute change is fine,
-            # so we only flag very obvious blow-ups.
-            if c_norm > NORM_EPSILON * 1e3:
-                violations.append({
-                    "param": c_name,
-                    "reason": "exploded_from_zero_king",
-                    "king_norm": round(k_norm, 8),
-                    "challenger_norm": round(c_norm, 6),
-                })
-            continue
-
-        ratio = c_norm / k_norm
-        if ratio > max_ratio or ratio < inv_max_ratio:
-            violations.append({
-                "param": c_name,
-                "reason": "norm_ratio",
-                "king_norm": round(k_norm, 6),
-                "challenger_norm": round(c_norm, 6),
-                "ratio": round(ratio, 4),
-            })
-            continue
-
-        numel = k_data.numel()
-        if numel == 0:
-            continue
-        k_zero_frac = (k_data == 0).float().mean().item()
-        c_zero_frac = (c_data == 0).float().mean().item()
-        if c_zero_frac - k_zero_frac > ZERO_FRAC_TOLERANCE:
-            violations.append({
-                "param": c_name,
-                "reason": "extra_exact_zeros",
-                "king_zero_frac": round(k_zero_frac, 6),
-                "challenger_zero_frac": round(c_zero_frac, 6),
-            })
-
-    return len(violations) == 0, violations
+    floor = min(king_gap * COHERENCE_RATIO_FLOOR, COHERENCE_FLOOR_NATS)
+    ok = chall_gap >= floor
+    reason = None if ok else (
+        f"coherence gap collapsed: challenger={chall_gap:.3f} nats, "
+        f"king={king_gap:.3f} nats, required >= {floor:.3f}"
+    )
+    return king_gap, chall_gap, ok, reason
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +585,7 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_keys, eval_n,
     total_done = 0
     target_total = 0
     t0 = time.time()
+    coherence_info: dict | None = None
 
     for shard_idx, shard_key in enumerate(shard_keys):
         n_tokens = get_shard_info(r2, shard_key)
@@ -619,6 +601,38 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_keys, eval_n,
                  shard_idx + 1, k, shard_key, actual_N)
         data_offset, shard_data = download_shard(r2, shard_key)
         seq_cache = extract_sequences(shard_data, data_offset, eval_indices, seq_len)
+
+        # Behavioral coherence probe: real LMs assign much lower CE to
+        # coherent text than to the same tokens shuffled. Run once on the
+        # first shard's sequences before any expensive bootstrap work; if
+        # the challenger is not actually modeling language, fail fast.
+        if shard_idx == 0 and not same_evaluator:
+            probe_rng = np.random.Generator(np.random.PCG64(base_seed ^ 0xC0DE))
+            king_gap, chall_gap, ok, reason = coherence_probe(
+                king_eval, challenger_eval, list(seq_cache.values()),
+                probe_rng,
+            )
+            coherence_info = {
+                "king_coherence_gap_nats": round(king_gap, 4),
+                "challenger_coherence_gap_nats": round(chall_gap, 4),
+                "floor_nats": round(min(king_gap * COHERENCE_RATIO_FLOOR,
+                                        COHERENCE_FLOOR_NATS), 4),
+            }
+            log.info("coherence probe: king_gap=%.3f chall_gap=%.3f ok=%s",
+                     king_gap, chall_gap, ok)
+            if not ok:
+                elapsed = time.time() - t0
+                return {
+                    "accepted": False,
+                    "verdict": "king",
+                    "rejection_reason": "coherence_probe_failed",
+                    "rejection_detail": reason,
+                    **coherence_info,
+                    "K_shards": k,
+                    "shards": list(shard_keys),
+                    "wall_time_s": round(elapsed, 1),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
 
         batches = [
             eval_indices[i : i + batch_size]
@@ -696,6 +710,8 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_keys, eval_n,
         "seqs_per_sec": round(total_done / elapsed, 1) if elapsed > 0 else 0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if coherence_info:
+        verdict.update(coherence_info)
     return verdict
 
 
