@@ -32,6 +32,14 @@ from safetensors import safe_open
 EVAL_N = 20_000
 EVAL_ALPHA = 0.001
 EVAL_DELTA = float(os.environ.get("TEUTONIC_EVAL_DELTA", "0.01"))
+# Maximum number of times the same (repo, commit) pair can be evaluated
+# before it is permanently skipped. 0 means unlimited.
+EVAL_MAX_RETRIES = int(os.environ.get("TEUTONIC_EVAL_MAX_RETRIES", "2"))
+# Number of independent shards to draw per eval. The bootstrap LCB is
+# computed on the *pooled* per-token diffs across all K shards. A
+# memorization / shard-overfit attack must now succeed on K independent
+# random shards simultaneously, which is exponentially harder than on one.
+EVAL_NUM_SHARDS = int(os.environ.get("TEUTONIC_NUM_SHARDS", "3"))
 SEQ_LEN = 2048
 POLL_INTERVAL = 30
 WEIGHT_INTERVAL = 300
@@ -596,7 +604,7 @@ class State:
         self.queue = []
         self.seen = set()
         self.failed_repos: set[str] = set()
-        self.evaluated_repos: set[str] = set()
+        self.eval_counts: dict[tuple[str, str], int] = {}
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
@@ -658,6 +666,7 @@ class State:
     def enqueue(self, reveal):
         repo = reveal.get("hf_repo", "")
         hotkey = reveal.get("hotkey", "")
+        commit = reveal.get("challenger_revision", "")
         king_hotkey = self.king.get("hotkey", "")
         if king_hotkey and hotkey == king_hotkey:
             log.info("skipping enqueue: hotkey %s is the current king", hotkey[:16])
@@ -666,8 +675,12 @@ class State:
             if existing.get("hf_repo") == repo:
                 log.info("skipping duplicate repo: %s already queued", repo)
                 return None
-        if repo in self.evaluated_repos:
-            log.info("skipping %s: already evaluated this cycle", repo)
+        # Dedup by (repo, commit): skip if already evaluated enough times.
+        eval_key = (repo, commit)
+        count = self.eval_counts.get(eval_key, 0)
+        if EVAL_MAX_RETRIES > 0 and count >= EVAL_MAX_RETRIES:
+            log.info("skipping %s@%s: already evaluated %d/%d times",
+                     repo, commit[:12], count, EVAL_MAX_RETRIES)
             return None
         cid = self.next_id()
         entry = {"challenge_id": cid, **reveal, "queued_at": _now()}
@@ -684,7 +697,7 @@ class State:
         _king_config = None
         _king_config_key = None
         self.failed_repos.clear()
-        self.evaluated_repos.clear()
+        self.eval_counts.clear()
         reign = self.king.get("reign_number", 0) + (0 if challenge_id == "seed" else 1)
         prev = self.king.copy() if self.king else None
         if prev:
@@ -752,7 +765,9 @@ class State:
 
     def replenish_reeval(self, subtensor, netuid):
         """Fill queue with re-eval candidates so the dashboard never shows empty."""
-        self.evaluated_repos.clear()
+        # Note: we do NOT clear eval_counts here — the retry limit still
+        # applies across replenish cycles. eval_counts is only cleared when
+        # a new king is crowned (set_king).
         throwaway_seen = set()
         reeval_reveals = scan_reveals(subtensor, netuid, throwaway_seen)
         king_hk = self.king.get("hotkey", "")
@@ -838,8 +853,13 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("skipping %s: repo %s previously failed", cid, hf_repo)
         return
 
-    if hf_repo in state.evaluated_repos:
-        log.info("skipping %s: repo %s already evaluated this cycle", cid, hf_repo)
+    # Commit-level dedup: skip if this exact (repo, commit) has been
+    # evaluated enough times already.
+    eval_key = (hf_repo, challenger_revision)
+    eval_count = state.eval_counts.get(eval_key, 0)
+    if EVAL_MAX_RETRIES > 0 and eval_count >= EVAL_MAX_RETRIES:
+        log.info("skipping %s: %s@%s already evaluated %d/%d times",
+                 cid, hf_repo, challenger_revision[:12], eval_count, EVAL_MAX_RETRIES)
         return
 
     if check_stale:
@@ -900,9 +920,24 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         state.flush()
         return
     n_shards = manifest["total_shards"]
+    # Pick K independent shard indices from one seed by hashing with distinct
+    # personalisations. Same (block_hash, hotkey) -> same K shards, so the
+    # eval is reproducible; but the miner cannot pre-overfit because they
+    # do not know block_hash until reveal.
     seed_mat = f"{block_hash}:{hotkey}".encode()
-    shard_idx = int.from_bytes(hashlib.blake2b(seed_mat, digest_size=8).digest(), "little") % n_shards
-    shard_key = manifest["shards"][shard_idx]["key"]
+    k = max(1, min(EVAL_NUM_SHARDS, n_shards))
+    shard_keys: list[str] = []
+    seen_idx: set[int] = set()
+    salt = 0
+    while len(shard_keys) < k:
+        h = hashlib.blake2b(seed_mat, digest_size=8,
+                             person=f"shard{salt:02d}".encode())
+        idx = int.from_bytes(h.digest(), "little") % n_shards
+        salt += 1
+        if idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        shard_keys.append(manifest["shards"][idx]["key"])
 
     king_repo = state.king.get("hf_repo", SEED_REPO)
     king_revision = state.king.get("king_revision", "")
@@ -912,7 +947,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         "king_revision": king_revision,
         "challenger_repo": hf_repo, "challenger_revision": challenger_revision,
         "hotkey": hotkey,
-        "N": EVAL_N, "alpha": EVAL_ALPHA, "delta": EVAL_DELTA, "shard": shard_key,
+        "N": EVAL_N, "alpha": EVAL_ALPHA, "delta": EVAL_DELTA,
+        "shards": shard_keys, "K_shards": k,
         "eval_block": eval_block, "block_hash": block_hash,
     })
 
@@ -931,7 +967,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             "challenger_repo": hf_repo,
             "block_hash": block_hash,
             "hotkey": hotkey,
-            "shard_key": shard_key,
+            "shard_keys": shard_keys,
             "king_hash": state.king.get("king_hash", ""),
             "king_revision": king_revision,
             "challenger_revision": challenger_revision,
@@ -997,7 +1033,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
              verdict.get("delta", 0), verdict["wall_time_s"])
 
     state.current_eval = None
-    state.evaluated_repos.add(hf_repo)
+    eval_key = (hf_repo, challenger_revision)
+    state.eval_counts[eval_key] = state.eval_counts.get(eval_key, 0) + 1
     state.record_verdict(verdict, hf_repo, hotkey)
 
     accepted = verdict.get("accepted", False)

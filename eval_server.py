@@ -29,7 +29,7 @@ from pydantic import BaseModel
 
 from eval_torch import (
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
-    check_weight_norms,
+    check_weight_norms, verify_commit_hash,
 )
 
 log = logging.getLogger("eval_server")
@@ -92,7 +92,8 @@ class EvalRequest(BaseModel):
     challenger_repo: str
     block_hash: str
     hotkey: str
-    shard_key: str
+    shard_keys: list[str] = []
+    shard_key: str = ""  # backward compat: single shard
     king_hash: str = ""
     king_revision: str = ""
     challenger_revision: str = ""
@@ -103,6 +104,14 @@ class EvalRequest(BaseModel):
     batch_size: int = DEFAULT_BATCH_SIZE
     n_bootstrap: int = DEFAULT_BOOTSTRAP_B
 
+    def resolved_shard_keys(self) -> list[str]:
+        """Return the list of shard keys, merging shard_key for compat."""
+        if self.shard_keys:
+            return self.shard_keys
+        if self.shard_key:
+            return [self.shard_key]
+        raise ValueError("no shard keys provided")
+
 
 # ---------------------------------------------------------------------------
 # Model management
@@ -111,6 +120,11 @@ class EvalRequest(BaseModel):
 def _ensure_king(repo: str, king_hash: str = "", revision: str = ""):
     """Load or reuse king evaluator. Reloads if repo, revision, or king_hash changed."""
     global _king_evaluator, _king_repo, _king_hash, _king_revision
+
+    # Verify the commit hash resolves correctly before loading.
+    if revision and len(revision) == 40:
+        verify_commit_hash(repo, revision)
+
     if (_king_evaluator and _king_repo == repo
             and (not revision or _king_revision == revision)
             and (not king_hash or _king_hash == king_hash)):
@@ -140,6 +154,10 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = ""):
 
 def _load_challenger(repo: str, revision: str = ""):
     """Load challenger on the second half of GPUs."""
+    # Verify the commit hash resolves correctly before loading.
+    if revision and len(revision) == 40:
+        verify_commit_hash(repo, revision)
+
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
     return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
@@ -302,7 +320,7 @@ def _run_eval(eval_id: str, req: EvalRequest):
 
         verdict = run_bootstrap_test(
             king_eval, challenger_eval,
-            _r2, req.shard_key, req.eval_n, req.alpha, req.delta,
+            _r2, req.resolved_shard_keys(), req.eval_n, req.alpha, req.delta,
             req.seq_len, req.batch_size, seed_str,
             n_bootstrap=req.n_bootstrap,
             on_progress=_on_progress,

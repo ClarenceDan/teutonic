@@ -351,9 +351,38 @@ def compute_paired_losses(king_model, chall_model, token_batches,
 # Model loading
 # ---------------------------------------------------------------------------
 
+def verify_commit_hash(repo: str, revision: str) -> str:
+    """Verify that a HF repo revision resolves to the expected commit SHA.
+
+    Calls the HF API to resolve the revision and returns the actual commit
+    hash. Raises ValueError if the resolved commit does not match the
+    requested 40-hex SHA. This is a defence-in-depth measure: even though
+    ``from_pretrained(revision=<sha>)`` already pins the download, a
+    post-download check ensures no TOCTOU or cache-poisoning attack can
+    silently substitute a different model.
+    """
+    from huggingface_hub import HfApi
+    token = os.environ.get("HF_TOKEN") or None
+    info = HfApi(token=token).model_info(repo, revision=revision)
+    actual = info.sha
+    if revision and len(revision) == 40 and actual != revision:
+        raise ValueError(
+            f"commit hash mismatch for {repo}: requested {revision} "
+            f"but HF resolved to {actual}"
+        )
+    return actual
+
+
 def load_model(repo, device, label="model", force_download=False, revision=None):
     log.info("loading %s from %s onto %s (force_download=%s, revision=%s)",
              label, repo, device, force_download, revision[:12] if revision else None)
+
+    # Pre-download commit verification: confirm the revision resolves
+    # to the expected SHA before we spend time pulling weights.
+    if revision and len(revision) == 40:
+        verify_commit_hash(repo, revision)
+        log.info("commit hash verified for %s@%s", repo, revision[:12])
+
     t0 = time.time()
     for attn_impl in ("flash_attention_2", "sdpa", "eager"):
         try:
@@ -373,10 +402,17 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
             log.warning("attn %s failed (%s), trying next", attn_impl, e)
     else:
         raise RuntimeError("could not load model with any attention implementation")
+
+    # Post-download commit verification: re-check that the cached model's
+    # commit still matches. Guards against cache-level tampering.
+    if revision and len(revision) == 40:
+        verify_commit_hash(repo, revision)
+
     model.eval()
     elapsed = time.time() - t0
     params = sum(p.numel() for p in model.parameters()) / 1e9
-    log.info("%s loaded: %.1fB params in %.1fs", label, params, elapsed)
+    log.info("%s loaded: %.1fB params in %.1fs (rev=%s verified)", label, params, elapsed,
+             revision[:12] if revision else "none")
     return model
 
 
@@ -533,50 +569,115 @@ def compute_paired_multi_gpu(king_eval, chall_eval, token_batches):
 # Bootstrap test
 # ---------------------------------------------------------------------------
 
-def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
+def run_bootstrap_test(king_eval, challenger_eval, r2, shard_keys, eval_n,
                        alpha, delta, seq_len, batch_size, seed_str,
                        n_bootstrap=10000, on_progress=None):
-    """Paired bootstrap test on per-token log-loss differences.
+    """Paired bootstrap LCB across K independent shards with cross-shard shuffling.
 
-    Scores M fixed-length blocks on both models, computes d_i = king_loss_i -
-    challenger_loss_i (positive means challenger is better), then bootstraps the
-    mean to get a one-sided lower confidence bound (LCB).  Accepts only if
-    LCB > delta.
+    For K = len(shard_keys), draws ~eval_n / K sequences from each shard
+    (deterministic from seed_str + shard index), downloads all shards first,
+    pools sequences, shuffles them across shard boundaries, then evaluates
+    in shuffled order. This prevents a miner from overfitting a single shard
+    and dilutes any shard-specific gaming across all K shards.
 
-    Calls on_progress(info_dict) after each batch if provided.
+    Backwards-compat: ``shard_keys`` may also be a single string for
+    one-off CLI invocations.
     """
-    n_tokens = get_shard_info(r2, shard_key)
-    n_sequences = n_tokens // seq_len
-    actual_N = min(eval_n, n_sequences)
-    log.info("bootstrap test: N=%d actual_N=%d alpha=%s delta=%.6f B=%d",
-             eval_n, actual_N, alpha, delta, n_bootstrap)
+    if isinstance(shard_keys, str):
+        shard_keys = [shard_keys]
+    if not shard_keys:
+        raise ValueError("at least one shard_key required")
 
-    seed_material = seed_str.encode()
-    seed = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), "little")
-    rng = np.random.Generator(np.random.PCG64(seed))
-    eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+    k = len(shard_keys)
+    per_shard_n = max(1, eval_n // k)
+    log.info("bootstrap test: K=%d shards, per_shard_n=%d, eval_n=%d alpha=%s delta=%.6f B=%d",
+             k, per_shard_n, eval_n, alpha, delta, n_bootstrap)
 
-    log.info("downloading shard %s ...", shard_key)
-    data_offset, shard_data = download_shard(r2, shard_key)
-
-    log.info("extracting %d sequences", actual_N)
-    seq_cache = extract_sequences(shard_data, data_offset, eval_indices, seq_len)
-    log.info("extracted %d sequences", len(seq_cache))
-
-    batches = [
-        eval_indices[i : i + batch_size]
-        for i in range(0, len(eval_indices), batch_size)
-    ]
-
-    all_diffs = []
-    king_sum, chall_sum = 0.0, 0.0
-    total_done = 0
-    t0 = time.time()
+    base_seed = int.from_bytes(
+        hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little"
+    )
 
     same_evaluator = king_eval is challenger_eval
 
+    # --- Phase 1: Download all shards and sample sequences ---
+    # Each sequence is tagged with (shard_index, local_index) for traceability.
+    all_sequences: list[list[int]] = []
+    t0 = time.time()
+
+    for shard_idx, shard_key in enumerate(shard_keys):
+        n_tokens = get_shard_info(r2, shard_key)
+        n_sequences = n_tokens // seq_len
+        actual_N = min(per_shard_n, n_sequences)
+
+        shard_seed = base_seed ^ (0xA5A5A5A5 * (shard_idx + 1))
+        rng = np.random.Generator(np.random.PCG64(shard_seed))
+        eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+
+        log.info("shard %d/%d %s: downloading & extracting %d sequences",
+                 shard_idx + 1, k, shard_key, actual_N)
+        data_offset, shard_data = download_shard(r2, shard_key)
+        seq_cache = extract_sequences(shard_data, data_offset, eval_indices, seq_len)
+        del shard_data  # free memory early
+
+        # Collect sequences in order; we will shuffle below.
+        for idx in eval_indices:
+            all_sequences.append(seq_cache[idx])
+        del seq_cache
+
+    total_N = len(all_sequences)
+    log.info("total sequences from %d shards: %d (download phase %.1fs)",
+             k, total_N, time.time() - t0)
+
+    # --- Phase 2: Cross-shard shuffle ---
+    # Deterministic shuffle so the eval is reproducible but the order is
+    # unpredictable to the miner.
+    shuffle_rng = np.random.Generator(np.random.PCG64(base_seed ^ 0x5F1E5F1E))
+    shuffle_order = shuffle_rng.permutation(total_N).tolist()
+    all_sequences = [all_sequences[i] for i in shuffle_order]
+    log.info("sequences shuffled across %d shards", k)
+
+    # --- Phase 2b: Coherence probe (before expensive full eval) ---
+    coherence_info: dict | None = None
+    if not same_evaluator:
+        probe_rng = np.random.Generator(np.random.PCG64(base_seed ^ 0xC0DE))
+        king_gap, chall_gap, ok, reason = coherence_probe(
+            king_eval, challenger_eval, all_sequences, probe_rng,
+        )
+        coherence_info = {
+            "king_coherence_gap_nats": round(king_gap, 4),
+            "challenger_coherence_gap_nats": round(chall_gap, 4),
+            "floor_nats": round(min(king_gap * COHERENCE_RATIO_FLOOR,
+                                    COHERENCE_FLOOR_NATS), 4),
+        }
+        log.info("coherence probe: king_gap=%.3f chall_gap=%.3f ok=%s",
+                 king_gap, chall_gap, ok)
+        if not ok:
+            elapsed = time.time() - t0
+            return {
+                "accepted": False,
+                "verdict": "king",
+                "rejection_reason": "coherence_probe_failed",
+                "rejection_detail": reason,
+                **coherence_info,
+                "K_shards": k,
+                "shards": list(shard_keys),
+                "wall_time_s": round(elapsed, 1),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+    # --- Phase 3: Batched eval on shuffled sequences ---
+    batches = [
+        list(range(i, min(i + batch_size, total_N)))
+        for i in range(0, total_N, batch_size)
+    ]
+
+    all_diffs: list[float] = []
+    king_sum = 0.0
+    chall_sum = 0.0
+    total_done = 0
+
     for bi, batch_indices in enumerate(batches):
-        token_batches = [seq_cache[idx] for idx in batch_indices]
+        token_batches = [all_sequences[idx] for idx in batch_indices]
 
         if same_evaluator:
             king_losses = king_eval.compute_losses(token_batches)
@@ -594,26 +695,29 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
 
         elapsed = time.time() - t0
         seqs_per_sec = total_done / elapsed if elapsed > 0 else 0
-        mu_hat = np.mean(all_diffs) if all_diffs else 0.0
+        mu_hat = float(np.mean(all_diffs)) if all_diffs else 0.0
         log.info(
             "batch %d/%d | done=%d/%d | mu_hat=%.6f | %.1f seq/s",
-            bi + 1, len(batches), total_done, actual_N, mu_hat, seqs_per_sec,
+            bi + 1, len(batches), total_done, total_N, mu_hat, seqs_per_sec,
         )
 
         if on_progress:
             on_progress({
-                "done": total_done, "total": actual_N,
+                "done": total_done, "total": total_N,
                 "mu_hat": round(float(mu_hat), 6),
                 "avg_king_loss": round(king_sum / total_done, 6),
                 "avg_challenger_loss": round(chall_sum / total_done, 6),
                 "seqs_per_sec": round(seqs_per_sec, 1),
+                "shard_count": k,
             })
+
+    del all_sequences
 
     elapsed = time.time() - t0
     d = np.array(all_diffs)
     mu_hat = float(d.mean())
 
-    boot_rng = np.random.Generator(np.random.PCG64(seed ^ 0xB007))
+    boot_rng = np.random.Generator(np.random.PCG64(base_seed ^ 0xB007))
     boot_means = np.empty(n_bootstrap)
     for b in range(n_bootstrap):
         idx = boot_rng.integers(0, len(d), size=len(d))
@@ -621,8 +725,8 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
     lcb = float(np.quantile(boot_means, alpha))
 
     accepted = lcb > delta
-    log.info("bootstrap result: mu_hat=%.6f lcb=%.6f delta=%.6f accepted=%s",
-             mu_hat, lcb, delta, accepted)
+    log.info("bootstrap result: K=%d N=%d mu_hat=%.6f lcb=%.6f delta=%.6f accepted=%s",
+             k, total_done, mu_hat, lcb, delta, accepted)
 
     verdict = {
         "accepted": accepted,
@@ -632,13 +736,17 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
         "delta": delta,
         "alpha": alpha,
         "n_bootstrap": n_bootstrap,
-        "N": actual_N,
+        "N": total_done,
+        "K_shards": k,
+        "shards": list(shard_keys),
         "avg_king_loss": round(king_sum / total_done, 6) if total_done else 0,
         "avg_challenger_loss": round(chall_sum / total_done, 6) if total_done else 0,
         "wall_time_s": round(elapsed, 1),
         "seqs_per_sec": round(total_done / elapsed, 1) if elapsed > 0 else 0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if coherence_info:
+        verdict.update(coherence_info)
     return verdict
 
 
@@ -684,7 +792,7 @@ def main():
     r2 = R2()
 
     if args.shard:
-        shard_key = args.shard
+        shard_keys = [args.shard]
     else:
         manifest = r2.ds_get("dataset/v2/manifest.json")
         if not manifest:
@@ -692,9 +800,11 @@ def main():
         if not manifest:
             log.error("could not fetch dataset manifest")
             sys.exit(1)
-        shard_key = manifest["shards"][0]["key"]
+        # Default: use first shard only for CLI; pass --shard multiple times
+        # or use the eval_server for multi-shard.
+        shard_keys = [manifest["shards"][0]["key"]]
         log.info("using shard: %s (%d shards available, version=%s)",
-                 shard_key, len(manifest["shards"]), manifest.get("version", "v1"))
+                 shard_keys[0], len(manifest["shards"]), manifest.get("version", "v1"))
 
     same_model = args.king == args.challenger
 
@@ -717,13 +827,13 @@ def main():
     log.info("  GPUs:       %s (%s)", gpu_ids, "shared" if same_model else "split")
     log.info("  N=%d  alpha=%s  delta=%.6f  bootstrap=%d  batch=%d  seq_len=%d",
              args.n, args.alpha, args.delta, args.n_bootstrap, args.batch_size, args.seq_len)
-    log.info("  shard: %s", shard_key)
+    log.info("  shards: %s", shard_keys)
     log.info("  seed:  %s", args.seed)
     log.info("=" * 60)
 
     verdict = run_bootstrap_test(
         king_eval, challenger_eval,
-        r2, shard_key, args.n, args.alpha, args.delta,
+        r2, shard_keys, args.n, args.alpha, args.delta,
         args.seq_len, args.batch_size, args.seed,
         n_bootstrap=args.n_bootstrap,
     )
