@@ -42,7 +42,6 @@ _gpu_ids: list[int] = []
 _r2: R2 | None = None
 _king_evaluator: MultiGPUEvaluator | None = None
 _king_repo: str | None = None
-_king_hash: str | None = None
 _king_revision: str | None = None
 _eval_lock = threading.Lock()
 _evals: dict[str, dict] = {}
@@ -93,9 +92,8 @@ class EvalRequest(BaseModel):
     block_hash: str
     hotkey: str
     shard_key: str
-    king_hash: str = ""
-    king_revision: str = ""
-    challenger_revision: str = ""
+    king_revision: str
+    challenger_revision: str
     eval_n: int = DEFAULT_EVAL_N
     alpha: float = DEFAULT_ALPHA
     delta: float = DEFAULT_DELTA
@@ -108,21 +106,26 @@ class EvalRequest(BaseModel):
 # Model management
 # ---------------------------------------------------------------------------
 
-def _ensure_king(repo: str, king_hash: str = "", revision: str = ""):
-    """Load or reuse king evaluator. Reloads if repo, revision, or king_hash changed."""
-    global _king_evaluator, _king_repo, _king_hash, _king_revision
+def _ensure_king(repo: str, revision: str):
+    """Load or reuse king evaluator, pinned to an explicit revision.
+
+    The revision is mandatory: every king the validator dispatches has a
+    fixed 40-hex git SHA, and we must never silently follow ``main`` because
+    a miner could swap the repo content under us between dispatch and load.
+    """
+    if not revision:
+        raise ValueError("king revision is required")
+    global _king_evaluator, _king_repo, _king_revision
     if (_king_evaluator and _king_repo == repo
-            and (not revision or _king_revision == revision)
-            and (not king_hash or _king_hash == king_hash)):
+            and _king_revision == revision):
         log.info("reusing cached king evaluator for %s (rev=%s)",
-                 repo, (_king_revision or "?")[:12])
+                 repo, revision[:12])
         return _king_evaluator
 
-    needs_reload = _king_evaluator is not None
-    if needs_reload:
+    if _king_evaluator is not None:
         log.info("king changed (%s rev=%s -> %s rev=%s), reloading",
                  _king_repo, (_king_revision or "?")[:12],
-                 repo, revision[:12] if revision else "?")
+                 repo, revision[:12])
         _king_evaluator.shutdown()
         _king_evaluator = None
         torch.cuda.empty_cache()
@@ -131,19 +134,20 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = ""):
     king_gpus = _gpu_ids[:mid] or _gpu_ids[:1]
     _king_evaluator = MultiGPUEvaluator(repo, king_gpus, label="king",
                                          force_download=False,
-                                         revision=revision or None)
+                                         revision=revision)
     _king_repo = repo
-    _king_hash = king_hash or None
-    _king_revision = revision or None
+    _king_revision = revision
     return _king_evaluator
 
 
-def _load_challenger(repo: str, revision: str = ""):
-    """Load challenger on the second half of GPUs."""
+def _load_challenger(repo: str, revision: str):
+    """Load challenger on the second half of GPUs at a pinned revision."""
+    if not revision:
+        raise ValueError("challenger revision is required")
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
     return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
-                              revision=revision or None)
+                              revision=revision)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +260,7 @@ def _run_eval(eval_id: str, req: EvalRequest):
     event_q: Queue = record["events"]
 
     try:
-        king_eval = _ensure_king(req.king_repo, req.king_hash, req.king_revision)
+        king_eval = _ensure_king(req.king_repo, req.king_revision)
 
         same_model = (req.king_repo == req.challenger_repo
                       and req.king_revision == req.challenger_revision)

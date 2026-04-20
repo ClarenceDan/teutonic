@@ -63,13 +63,26 @@ TMC_API_KEY = os.environ.get("TMC_API_KEY", "")
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
-REPO_PATTERN = r"^[^/]+/Teutonic-I-.+$"
+# Reveal payload format (post-V2): "<king_revision>:<challenger_repo>:<challenger_revision>"
+# - king_revision and challenger_revision MUST be 40-char lowercase hex git SHAs.
+# - challenger_repo MUST match the Teutonic-I namespace pattern below.
+# Anything else is silently dropped at scan time. There is no backwards compat.
+import re as _re
+_REPO_FRAGMENT = r"[A-Za-z0-9_.\-]+"
+REVEAL_RE = _re.compile(
+    rf"^(?P<king_rev>[0-9a-f]{{40}}):"
+    rf"(?P<repo>{_REPO_FRAGMENT}/Teutonic-I-{_REPO_FRAGMENT}):"
+    rf"(?P<chal_rev>[0-9a-f]{{40}})$"
+)
 
-NORM_SANITY_MAX_ABS = float(os.environ.get("TEUTONIC_NORM_SANITY_MAX_ABS", "1000"))
-NORM_SANITY_MAX_MEAN_ABS = float(os.environ.get("TEUTONIC_NORM_SANITY_MAX_MEAN_ABS", "100"))
-NORM_SANITY_MAX_STD = float(os.environ.get("TEUTONIC_NORM_SANITY_MAX_STD", "100"))
-NORM_SANITY_MAX_RATIO = float(os.environ.get("TEUTONIC_NORM_SANITY_MAX_RATIO", "50"))
-NORM_SANITY_SAMPLE_LIMIT = int(os.environ.get("TEUTONIC_NORM_SANITY_SAMPLE_LIMIT", "256"))
+# Structural sanity (per-tensor, vs SEED_REPO fingerprint).
+# These are *absolute* checks: a poisoned king cannot weaken them by becoming
+# the new reference, because the reference is the immutable seed model.
+SEED_FP_KEY = "state/seed_fingerprint_v1.json"
+STRUCT_RATIO_MAX = float(os.environ.get("TEUTONIC_STRUCT_RATIO_MAX", "10.0"))
+STRUCT_EXTRA_ZERO_FRAC = float(os.environ.get("TEUTONIC_STRUCT_EXTRA_ZERO_FRAC", "0.001"))
+STRUCT_FLAT_TENSOR_STD = float(os.environ.get("TEUTONIC_STRUCT_FLAT_TENSOR_STD", "1e-8"))
+KING_HEALTH_INTERVAL_S = float(os.environ.get("TEUTONIC_KING_HEALTH_INTERVAL_S", "3600"))
 
 TMC_BASE = "https://api.taomarketcap.com/public/v1"
 
@@ -307,201 +320,255 @@ class R2:
 
 
 # ---------------------------------------------------------------------------
-# Challenger validation
+# Model structural validation
+#
+# Every model that the validator interacts with — challenger before eval, king
+# before crowning, king at startup — is fingerprinted tensor-by-tensor and
+# compared against an immutable reference: the SEED_REPO model. The seed is
+# the only trust anchor. All ratio / sparsity bounds are absolute against the
+# seed, never relative to the current king. This is what makes the system
+# resilient to a poisoned king dethroning every honest challenger by being
+# hard to beat: such a king can never be crowned in the first place because
+# its structural fingerprint will fall outside the seed bounds.
 # ---------------------------------------------------------------------------
 
-_king_config: dict | None = None
-_king_config_key: str | None = None
-_norm_stats_cache: dict[str, dict] = {}
+_seed_fingerprint: dict[str, dict] | None = None
+_seed_config: dict | None = None
+_fp_cache: dict[str, dict[str, dict]] = {}  # bounded by _FP_CACHE_MAX
+_FP_CACHE_MAX = 16
+_config_cache: dict[str, dict] = {}
 
 
-def _safe_ratio(numerator: float, denominator: float) -> float:
-    denom = max(abs(denominator), 1e-12)
-    return abs(numerator) / denom
+def _fp_cache_put(key: str, value: dict[str, dict]) -> None:
+    if len(_fp_cache) >= _FP_CACHE_MAX:
+        # Drop oldest insertion. dict preserves insertion order in CPython.
+        _fp_cache.pop(next(iter(_fp_cache)))
+    _fp_cache[key] = value
 
 
-def _is_norm_tensor(name: str) -> bool:
-    lname = name.lower()
-    return lname.endswith("norm.weight") or ".norm.weight" in lname or "layernorm.weight" in lname or "rmsnorm.weight" in lname
+def _fetch_config(repo: str, revision: str) -> dict:
+    """Fetch and cache config.json at a pinned revision."""
+    cache_key = f"{repo}@{revision}"
+    cached = _config_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    api = HfApi(token=HF_TOKEN or None)
+    cfg_path = api.hf_hub_download(repo, "config.json",
+                                   token=HF_TOKEN or None,
+                                   revision=revision)
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if len(_config_cache) >= 64:
+        _config_cache.pop(next(iter(_config_cache)))
+    _config_cache[cache_key] = cfg
+    return cfg
 
 
-def _tensor_stats(arr: np.ndarray) -> dict[str, float]:
-    arr = arr.astype(np.float64, copy=False).reshape(-1)
-    finite = np.isfinite(arr)
-    if not finite.all():
-        bad = int(arr.size - finite.sum())
-        return {"has_non_finite": True, "non_finite_count": bad}
-    abs_arr = np.abs(arr)
-    return {
-        "has_non_finite": False,
-        "size": int(arr.size),
-        "max_abs": float(abs_arr.max(initial=0.0)),
-        "mean_abs": float(abs_arr.mean()) if arr.size else 0.0,
-        "std": float(arr.std()) if arr.size else 0.0,
-    }
-
-
-def _collect_norm_stats(hf_repo: str, revision: str) -> dict[str, dict]:
-    cache_key = f"{hf_repo}@{revision or 'HEAD'}"
-    cached = _norm_stats_cache.get(cache_key)
+def _compute_fingerprint(repo: str, revision: str) -> dict[str, dict]:
+    """Stream every safetensors tensor at the pinned revision and produce
+    structural stats. Always called with a non-empty 40-hex git SHA so HF
+    will refuse to silently substitute a different commit."""
+    if not revision:
+        raise ValueError("revision is required for fingerprinting")
+    cache_key = f"{repo}@{revision}"
+    cached = _fp_cache.get(cache_key)
     if cached is not None:
         return cached
 
     api = HfApi(token=HF_TOKEN or None)
-    repo_files = api.list_repo_files(hf_repo, token=HF_TOKEN or None, revision=revision or None)
-    st_files = sorted([s for s in repo_files if s.endswith(".safetensors")])
-    stats: dict[str, dict] = {}
+    files = sorted(
+        s for s in api.list_repo_files(repo, token=HF_TOKEN or None, revision=revision)
+        if s.endswith(".safetensors")
+    )
+    if not files:
+        raise ValueError("no .safetensors files in repo")
 
-    with tempfile.TemporaryDirectory(prefix="teutonic-sanity-") as tmpdir:
-        for relpath in st_files:
+    out: dict[str, dict] = {}
+    with tempfile.TemporaryDirectory(prefix="teutonic-fp-") as tmpdir:
+        for rel in files:
             local_path = api.hf_hub_download(
-                hf_repo,
-                relpath,
-                token=HF_TOKEN or None,
-                revision=revision or None,
-                local_dir=tmpdir,
+                repo, rel, token=HF_TOKEN or None,
+                revision=revision, local_dir=tmpdir,
             )
             with safe_open(local_path, framework="np") as f:
-                for key in f.keys():
-                    if not _is_norm_tensor(key):
+                for name in f.keys():
+                    arr = f.get_tensor(name).astype(np.float64, copy=False).reshape(-1)
+                    if arr.size == 0:
+                        out[name] = {"size": 0}
                         continue
-                    stats[key] = _tensor_stats(f.get_tensor(key))
-                    if len(stats) >= NORM_SANITY_SAMPLE_LIMIT:
-                        _norm_stats_cache[cache_key] = stats
-                        return stats
+                    finite = np.isfinite(arr)
+                    if not bool(finite.all()):
+                        out[name] = {
+                            "size": int(arr.size),
+                            "has_non_finite": True,
+                            "non_finite_count": int(arr.size - finite.sum()),
+                        }
+                        continue
+                    abs_arr = np.abs(arr)
+                    out[name] = {
+                        "size": int(arr.size),
+                        "has_non_finite": False,
+                        "l2": float(np.linalg.norm(arr)),
+                        "max_abs": float(abs_arr.max()),
+                        "mean_abs": float(abs_arr.mean()),
+                        "std": float(arr.std()),
+                        "exact_zero_frac": float((arr == 0.0).mean()),
+                    }
+    _fp_cache_put(cache_key, out)
+    return out
 
-    _norm_stats_cache[cache_key] = stats
-    return stats
+
+def _load_seed_fingerprint(r2) -> dict[str, dict]:
+    """Return the seed model's fingerprint, building it once on first use.
+
+    Persisted to R2 so subsequent validator restarts skip the ~GB download.
+    The seed is implicitly trusted; if it ever fails to load we cannot
+    validate anything, which is by design."""
+    global _seed_fingerprint
+    if _seed_fingerprint is not None:
+        return _seed_fingerprint
+
+    cached = r2.get(SEED_FP_KEY)
+    if cached and isinstance(cached.get("fingerprint"), dict):
+        _seed_fingerprint = cached["fingerprint"]
+        log.info("loaded seed fingerprint from R2: %d tensors, repo=%s rev=%s",
+                 len(_seed_fingerprint), cached.get("repo"),
+                 (cached.get("revision") or "?")[:12])
+        return _seed_fingerprint
+
+    api = HfApi(token=HF_TOKEN or None)
+    seed_rev = api.model_info(SEED_REPO).sha
+    log.info("computing seed fingerprint for %s@%s (one-time, downloads safetensors)",
+             SEED_REPO, seed_rev[:12])
+    fp = _compute_fingerprint(SEED_REPO, seed_rev)
+    r2.put(SEED_FP_KEY, {
+        "repo": SEED_REPO,
+        "revision": seed_rev,
+        "fingerprint": fp,
+        "computed_at": _now(),
+    })
+    _seed_fingerprint = fp
+    log.info("seed fingerprint computed and cached: %d tensors", len(fp))
+    return fp
 
 
-def validate_challenger_sanity(hf_repo: str, challenger_revision: str,
-                               king_repo: str = "",
-                               king_revision: str = "") -> str | None:
-    """Reject challengers with obviously pathological norm weights."""
+def validate_model_structure(repo: str, revision: str,
+                             seed_fp: dict[str, dict]) -> str | None:
+    """Compare a model's per-tensor fingerprint against the seed.
+
+    Returns None if structurally sane, else a human-readable rejection
+    reason. Bounds are absolute against the seed:
+      - tensor name set must match the seed (architecture lockdown)
+      - no non-finite values in any tensor
+      - L2 and max_abs ratio vs seed within [1/R, R]
+      - exact-zero fraction may exceed seed's by at most STRUCT_EXTRA_ZERO_FRAC
+      - non-trivial tensors cannot collapse to a constant (std > floor)
+    """
+    if repo == SEED_REPO:
+        return None  # seed is the trust root, by definition healthy
     try:
-        challenger_stats = _collect_norm_stats(hf_repo, challenger_revision)
+        fp = _compute_fingerprint(repo, revision)
     except Exception as e:
-        return f"cannot inspect safetensors: {e}"
+        return f"cannot fingerprint model: {e}"
 
-    if not challenger_stats:
-        return "no norm.weight tensors found in safetensors"
+    extra = sorted(set(fp) - set(seed_fp))
+    missing = sorted(set(seed_fp) - set(fp))
+    if extra or missing:
+        sample = (extra[:3] + missing[:3])[:5]
+        return (f"tensor name set differs from seed "
+                f"(extra={len(extra)} missing={len(missing)}): {sample}")
 
-    for name, stats in challenger_stats.items():
-        if stats.get("has_non_finite"):
-            return f"non-finite values in {name} ({stats.get('non_finite_count', '?')} entries)"
-        if stats["max_abs"] > NORM_SANITY_MAX_ABS:
-            return f"norm_weight_scaled:{name}={stats['max_abs']:.1f} exceeds {NORM_SANITY_MAX_ABS:.1f}"
-        if stats["mean_abs"] > NORM_SANITY_MAX_MEAN_ABS:
-            return f"norm_weight_mean_abs:{name}={stats['mean_abs']:.3f} exceeds {NORM_SANITY_MAX_MEAN_ABS:.3f}"
-        if stats["std"] > NORM_SANITY_MAX_STD:
-            return f"norm_weight_std:{name}={stats['std']:.3f} exceeds {NORM_SANITY_MAX_STD:.3f}"
-
-    ref_repo = king_repo or SEED_REPO
-    try:
-        king_stats = _collect_norm_stats(ref_repo, king_revision)
-    except Exception:
-        king_stats = {}
-
-    for name, stats in challenger_stats.items():
-        king = king_stats.get(name)
-        if not king or king.get("has_non_finite"):
+    inv_max = 1.0 / STRUCT_RATIO_MAX
+    for name, s in fp.items():
+        if s.get("has_non_finite"):
+            return f"non-finite values in {name} ({s.get('non_finite_count', '?')} entries)"
+        if s.get("size", 0) == 0:
             continue
-        if _safe_ratio(stats["max_abs"], king.get("max_abs", 0.0)) > NORM_SANITY_MAX_RATIO:
-            return (
-                f"norm_weight_ratio:{name} max_abs_ratio="
-                f"{_safe_ratio(stats['max_abs'], king.get('max_abs', 0.0)):.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
-            )
-        if _safe_ratio(stats["mean_abs"], king.get("mean_abs", 0.0)) > NORM_SANITY_MAX_RATIO:
-            return (
-                f"norm_weight_ratio:{name} mean_abs_ratio="
-                f"{_safe_ratio(stats['mean_abs'], king.get('mean_abs', 0.0)):.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
-            )
+
+        ref = seed_fp[name]
+        if ref.get("has_non_finite") or ref.get("size", 0) == 0:
+            continue
+
+        # L2 ratio
+        ref_l2 = max(ref.get("l2", 0.0), 1e-9)
+        ratio_l2 = s["l2"] / ref_l2
+        if ratio_l2 > STRUCT_RATIO_MAX or ratio_l2 < inv_max:
+            return (f"{name} L2 ratio vs seed = {ratio_l2:.3f}x "
+                    f"(allowed [{inv_max:.3f}, {STRUCT_RATIO_MAX:.3f}])")
+
+        # Max-abs ratio (catches per-element scaling that L2 might dilute)
+        ref_max = max(ref.get("max_abs", 0.0), 1e-9)
+        ratio_max = s["max_abs"] / ref_max
+        if ratio_max > STRUCT_RATIO_MAX or ratio_max < inv_max:
+            return (f"{name} max_abs ratio vs seed = {ratio_max:.3f}x "
+                    f"(allowed [{inv_max:.3f}, {STRUCT_RATIO_MAX:.3f}])")
+
+        # Excess sparsity. Honestly trained dense weights have ~0 exact zeros.
+        extra_zero = s["exact_zero_frac"] - ref.get("exact_zero_frac", 0.0)
+        if extra_zero > STRUCT_EXTRA_ZERO_FRAC:
+            return (f"{name} has {extra_zero*100:.3f}% more exact-zeros than seed "
+                    f"(threshold {STRUCT_EXTRA_ZERO_FRAC*100:.3f}%)")
+
+        # Tensor collapsed to a constant (zero std with non-zero mean is also a flag).
+        if s["size"] > 1 and s["std"] < STRUCT_FLAT_TENSOR_STD and ref.get("std", 0.0) > STRUCT_FLAT_TENSOR_STD:
+            return f"{name} collapsed to near-constant (std={s['std']:.2e})"
 
     return None
 
 
-def get_king_config(king_repo: str, king_revision: str = ""):
-    """Fetch and cache the king model's config.json from HuggingFace."""
-    global _king_config, _king_config_key
-    cache_key = f"{king_repo}@{king_revision}"
-    if _king_config is not None and _king_config_key == cache_key:
-        return _king_config
-    try:
-        api = HfApi(token=HF_TOKEN or None)
-        cfg_path = api.hf_hub_download(king_repo, "config.json",
-                                        token=HF_TOKEN or None,
-                                        revision=king_revision or None)
-        with open(cfg_path) as f:
-            _king_config = json.load(f)
-            _king_config_key = cache_key
-    except Exception:
-        log.warning("could not fetch king config.json from %s@%s",
-                    king_repo, (king_revision or "HEAD")[:12])
-        _king_config = {}
-        _king_config_key = cache_key
-    return _king_config
-
-
 def validate_challenger_config(hf_repo: str, challenger_revision: str,
-                                king_repo: str = "",
-                                king_revision: str = "") -> str | None:
-    """Check challenger config.json matches king architecture before deploying.
+                               seed_fp: dict[str, dict]) -> str | None:
+    """Architecture lockdown + full structural check at the pinned revision.
 
-    All HF API calls use the pinned challenger_revision to prevent TOCTOU
-    attacks where a miner swaps safetensors for a malicious pickle between
-    validation and evaluation.
-
-    Returns None if OK, or a human-readable rejection reason.
+    All HF reads use the explicit challenger_revision; the validator never
+    follows ``main``, so a miner cannot swap safetensors between scan time
+    and eval time. Returns None if the challenger may proceed to GPU eval,
+    otherwise a human-readable rejection reason.
     """
-    king_cfg = get_king_config(king_repo or SEED_REPO, king_revision)
-    if not king_cfg:
-        return None
+    global _seed_config
+    if _seed_config is None:
+        try:
+            api = HfApi(token=HF_TOKEN or None)
+            seed_rev = api.model_info(SEED_REPO).sha
+            _seed_config = _fetch_config(SEED_REPO, seed_rev)
+        except Exception:
+            log.warning("could not fetch seed config.json from %s", SEED_REPO)
+            _seed_config = {}
 
     try:
-        api = HfApi(token=HF_TOKEN or None)
-        cfg_path = api.hf_hub_download(hf_repo, "config.json",
-                                        token=HF_TOKEN or None,
-                                        revision=challenger_revision)
-        with open(cfg_path) as f:
-            challenger_cfg = json.load(f)
+        challenger_cfg = _fetch_config(hf_repo, challenger_revision)
     except Exception as e:
         return f"cannot fetch config.json: {e}"
 
-    king_arch = king_cfg.get("architectures", [])
-    chall_arch = challenger_cfg.get("architectures", [])
-    if king_arch and chall_arch and king_arch != chall_arch:
-        return f"architecture mismatch: king={king_arch} challenger={chall_arch}"
+    if _seed_config:
+        seed_arch = _seed_config.get("architectures", [])
+        chall_arch = challenger_cfg.get("architectures", [])
+        if seed_arch and chall_arch and seed_arch != chall_arch:
+            return f"architecture mismatch: seed={seed_arch} challenger={chall_arch}"
 
-    for key in ("vocab_size", "hidden_size", "num_hidden_layers",
-                "num_attention_heads", "num_key_value_heads", "head_dim",
-                "intermediate_size", "model_type"):
-        king_val = king_cfg.get(key)
-        chall_val = challenger_cfg.get(key)
-        if king_val is not None and chall_val is not None and king_val != chall_val:
-            return f"{key} mismatch: king={king_val} challenger={chall_val}"
+        for key in ("vocab_size", "hidden_size", "num_hidden_layers",
+                    "num_attention_heads", "num_key_value_heads", "head_dim",
+                    "intermediate_size", "model_type"):
+            seed_val = _seed_config.get(key)
+            chall_val = challenger_cfg.get(key)
+            if seed_val is not None and chall_val is not None and seed_val != chall_val:
+                return f"{key} mismatch: seed={seed_val} challenger={chall_val}"
 
-    st_files = [s for s in api.list_repo_files(hf_repo, token=HF_TOKEN or None,
-                                                revision=challenger_revision)
-                if s.endswith(".safetensors")]
-    if not st_files:
-        return "no .safetensors files in repo"
-
-    return validate_challenger_sanity(
-        hf_repo,
-        challenger_revision,
-        king_repo=king_repo,
-        king_revision=king_revision,
-    )
+    return validate_model_structure(hf_repo, challenger_revision, seed_fp)
 
 
 # ---------------------------------------------------------------------------
 # Chain
 # ---------------------------------------------------------------------------
 
-import re
-_REPO_RE = re.compile(REPO_PATTERN)
-
 def scan_reveals(subtensor, netuid, seen):
+    """Pull revealed commitments and parse them under the strict v2 schema.
+
+    Payload: ``<king_revision>:<challenger_repo>:<challenger_revision>``
+    Both revisions MUST be lowercase 40-hex git SHAs; the repo MUST sit in the
+    Teutonic-I namespace. Any reveal that fails to parse is silently dropped
+    so a malformed legacy payload cannot keep being re-tried forever.
+    """
     try:
         all_reveals = subtensor.get_all_revealed_commitments(netuid)
     except Exception:
@@ -515,17 +582,18 @@ def scan_reveals(subtensor, netuid, seen):
         if hotkey in seen or not entries:
             continue
         block, data = max(entries, key=lambda e: e[0])
-        parts = data.split(":", 2)
-        if len(parts) != 3:
-            continue
-        king_hash, hf_repo, model_hash = parts
-        if not _REPO_RE.match(hf_repo.strip()):
+        m = REVEAL_RE.match((data or "").strip())
+        if not m:
+            seen.add(hotkey)
+            log.info("dropping malformed reveal from %s (block=%d)", hotkey[:16], block)
             continue
         seen.add(hotkey)
         new.append({
-            "hotkey": hotkey, "block": block,
-            "king_hash": king_hash.strip(), "hf_repo": hf_repo.strip(),
-            "model_hash": model_hash.strip(),
+            "hotkey": hotkey,
+            "block": block,
+            "king_revision": m.group("king_rev"),
+            "hf_repo": m.group("repo"),
+            "challenger_revision": m.group("chal_rev"),
         })
     new.sort(key=lambda x: x["block"])
     return new
@@ -612,7 +680,19 @@ class State:
             self.king = k
         q = self.r2.get("state/queue.json")
         if q:
-            self.queue = q.get("pending", [])
+            pending = q.get("pending", [])
+            # Drop queue entries from older payload schemas. The new schema
+            # requires both king_revision and challenger_revision as 40-hex.
+            self.queue = [
+                e for e in pending
+                if isinstance(e.get("king_revision"), str)
+                and isinstance(e.get("challenger_revision"), str)
+                and len(e["king_revision"]) == 40
+                and len(e["challenger_revision"]) == 40
+            ]
+            dropped = len(pending) - len(self.queue)
+            if dropped:
+                log.warning("dropped %d legacy queue entries during load", dropped)
         s = self.r2.get("state/seen_hotkeys.json")
         if s:
             self.seen = set(s.get("hotkeys", []))
@@ -630,8 +710,10 @@ class State:
         h = self.r2.get("state/dashboard_history.json")
         if h:
             self.history = h.get("history", [])
-        log.info("loaded state: king=%s queue=%d seen=%d",
-                 self.king.get("king_hash", "none")[:16], len(self.queue), len(self.seen))
+        log.info("loaded state: king=%s@%s queue=%d seen=%d",
+                 self.king.get("hf_repo", "none"),
+                 (self.king.get("king_revision") or "none")[:12],
+                 len(self.queue), len(self.seen))
 
     def flush(self):
         self.r2.put("state/validator_state.json", {
@@ -678,11 +760,9 @@ class State:
         self.event({"event": "queued", **entry})
         return cid
 
-    def set_king(self, hotkey, hf_repo, king_hash, block, challenge_id="seed",
-                  king_revision=""):
-        global _king_config, _king_config_key
-        _king_config = None
-        _king_config_key = None
+    def set_king(self, hotkey, hf_repo, king_revision, block, challenge_id="seed"):
+        global _seed_config
+        _seed_config = None
         self.failed_repos.clear()
         self.evaluated_repos.clear()
         reign = self.king.get("reign_number", 0) + (0 if challenge_id == "seed" else 1)
@@ -690,7 +770,7 @@ class State:
         if prev:
             prev.pop("previous_king", None)
         self.king = {
-            "hotkey": hotkey, "hf_repo": hf_repo, "king_hash": king_hash,
+            "hotkey": hotkey, "hf_repo": hf_repo,
             "king_revision": king_revision,
             "reign_number": reign, "crowned_at": _now(),
             "crowned_block": block, "challenge_id": challenge_id,
@@ -699,7 +779,8 @@ class State:
         self.flush()
         self.flush_dashboard()
         self.event({"event": "king_changed", "hotkey": hotkey, "reign": reign,
-                     "challenge_id": challenge_id})
+                     "challenge_id": challenge_id, "hf_repo": hf_repo,
+                     "king_revision": king_revision})
 
     def record_verdict(self, verdict, challenger_repo, hotkey):
         king_loss = verdict["avg_king_loss"]
@@ -819,6 +900,74 @@ def check_king_alive(state):
         return False
 
 
+def enforce_king_health(state, r2, wallet, subtensor, seed_fp) -> bool:
+    """Verify the current king passes structural checks against the seed.
+
+    If it does not, walk down the previous_king chain until we find one that
+    does, or fall back to the SEED_REPO. This is the circuit breaker that
+    prevents a poisoned king from reigning forever just because no honest
+    miner can statistically beat its tampered weights.
+
+    Returns True if the king was changed.
+    """
+    repo = state.king.get("hf_repo", "")
+    rev = state.king.get("king_revision", "")
+    if not repo or not rev:
+        return False
+
+    rejection = validate_model_structure(repo, rev, seed_fp)
+    if rejection is None:
+        return False
+
+    log.error("KING %s@%s FAILS STRUCTURAL CHECK: %s — auto-dethroning",
+              repo, rev[:12], rejection)
+    state.event({"event": "king_dethroned_unhealthy",
+                 "hf_repo": repo, "king_revision": rev,
+                 "reason": rejection})
+
+    candidate = state.king.get("previous_king")
+    while candidate:
+        c_repo = candidate.get("hf_repo", "")
+        c_rev = candidate.get("king_revision", "")
+        if not c_repo or not c_rev:
+            candidate = candidate.get("previous_king")
+            continue
+        try:
+            HfApi(token=HF_TOKEN or None).model_info(c_repo, revision=c_rev)
+        except Exception as e:
+            log.warning("previous king %s@%s unreachable, walking back: %s",
+                        c_repo, c_rev[:12], e)
+            candidate = candidate.get("previous_king")
+            continue
+        if validate_model_structure(c_repo, c_rev, seed_fp) is not None:
+            log.warning("previous king %s@%s also fails structural check, walking back",
+                        c_repo, c_rev[:12])
+            candidate = candidate.get("previous_king")
+            continue
+        log.info("reverting to healthy previous king %s@%s",
+                 c_repo, c_rev[:12])
+        state.set_king(candidate.get("hotkey", ""), c_repo, c_rev,
+                       candidate.get("crowned_block", 0),
+                       challenge_id=candidate.get("challenge_id", "auto-revert"))
+        maybe_set_weights(subtensor, wallet, state, force=True,
+                          reason="king_dethroned_unhealthy revert")
+        return True
+
+    # No healthy ancestor — fall back to the seed.
+    try:
+        seed_rev = HfApi(token=HF_TOKEN or None).model_info(SEED_REPO).sha
+    except Exception:
+        log.exception("FATAL: could not resolve seed king during recovery")
+        return False
+    log.warning("falling all the way back to seed king %s@%s",
+                SEED_REPO, seed_rev[:12])
+    state.set_king(wallet.hotkey.ss58_address, SEED_REPO, seed_rev,
+                   subtensor.block, challenge_id="seed-revert")
+    maybe_set_weights(subtensor, wallet, state, force=True,
+                      reason="king_dethroned_unhealthy seed-revert")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -827,7 +976,10 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     cid = entry["challenge_id"]
     hotkey = entry["hotkey"]
     hf_repo = entry["hf_repo"]
-    log.info("processing %s from %s repo=%s", cid, hotkey[:16], hf_repo)
+    challenger_revision = entry["challenger_revision"]
+    entry_king_revision = entry["king_revision"]
+    log.info("processing %s from %s repo=%s@%s", cid, hotkey[:16], hf_repo,
+             challenger_revision[:12])
 
     king_hotkey = state.king.get("hotkey", "")
     if king_hotkey and hotkey == king_hotkey:
@@ -842,31 +994,36 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("skipping %s: repo %s already evaluated this cycle", cid, hf_repo)
         return
 
-    if check_stale:
-        current_hash = state.king.get("king_hash", "")
-        entry_king_hash = entry.get("king_hash", "")
-        if current_hash and entry_king_hash and not current_hash.startswith(entry_king_hash[:len(entry_king_hash)]):
-            log.info("stale %s: king changed (entry=%s current=%s)", cid, entry_king_hash[:16], current_hash[:16])
-            state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
-            return
-
-    try:
-        challenger_info = HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision="main")
-        challenger_revision = challenger_info.sha
-        log.info("challenger %s pinned at revision %s", hf_repo, challenger_revision[:12])
-    except Exception as exc:
-        log.warning("cannot get commit SHA for %s, skipping", hf_repo)
-        state.failed_repos.add(hf_repo)
-        state.record_failure(entry, "hf_metadata_error", str(exc))
+    # Stale check uses full SHA equality. The reveal commits a specific king
+    # by its 40-hex git revision; if the current king has rotated since, we
+    # drop the entry rather than evaluate against a king the miner did not
+    # target.
+    current_king_revision = state.king.get("king_revision", "")
+    if check_stale and current_king_revision and entry_king_revision != current_king_revision:
+        log.info("stale %s: targets king rev %s but current is %s",
+                 cid, entry_king_revision[:12], current_king_revision[:12])
+        state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey,
+                     "entry_king_revision": entry_king_revision,
+                     "current_king_revision": current_king_revision})
         return
 
-    rejection = validate_challenger_config(
-        hf_repo, challenger_revision,
-        king_repo=state.king.get("hf_repo", ""),
-        king_revision=state.king.get("king_revision", ""),
-    )
+    # Verify the pinned challenger revision actually exists on HF. We never
+    # follow ``main`` — the only revision we ever read is the one the miner
+    # committed in the reveal payload.
+    try:
+        HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision=challenger_revision)
+    except Exception as exc:
+        log.warning("challenger revision unreachable %s@%s: %s",
+                    hf_repo, challenger_revision[:12], exc)
+        state.failed_repos.add(hf_repo)
+        state.record_failure(entry, "hf_revision_unreachable", str(exc))
+        return
+
+    seed_fp = _load_seed_fingerprint(r2)
+    rejection = validate_challenger_config(hf_repo, challenger_revision, seed_fp)
     if rejection:
-        log.warning("rejecting %s (%s): %s", cid, hf_repo, rejection)
+        log.warning("rejecting %s (%s@%s): %s", cid, hf_repo,
+                    challenger_revision[:12], rejection)
         state.failed_repos.add(hf_repo)
         state.record_failure(entry, "config_rejected", rejection)
         state.event({"event": "config_rejected", "challenge_id": cid,
@@ -874,6 +1031,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         return
 
     block_hash = "default"
+    eval_block = 0
     try:
         eval_block = subtensor.block
         block_hash = subtensor.get_block_hash(eval_block) or "default"
@@ -932,7 +1090,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             "block_hash": block_hash,
             "hotkey": hotkey,
             "shard_key": shard_key,
-            "king_hash": state.king.get("king_hash", ""),
             "king_revision": king_revision,
             "challenger_revision": challenger_revision,
             "eval_n": EVAL_N,
@@ -1013,9 +1170,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     if accepted:
         log.info("DETHRONE! %s wins via %s (repo=%s rev=%s)",
                  hotkey[:16], cid, hf_repo, challenger_revision[:12])
-        state.set_king(hotkey, hf_repo, entry.get("model_hash", ""),
-                       entry.get("block", 0), cid,
-                       king_revision=challenger_revision)
+        state.set_king(hotkey, hf_repo, challenger_revision,
+                       entry.get("block", 0), cid)
         state.last_winner_hotkey = hotkey
         await notify_new_king(state.king, verdict)
         maybe_set_weights(subtensor, wallet, state, force=True,
@@ -1058,15 +1214,30 @@ async def main():
         log.info("uploaded dashboard to Hippius")
 
     if not state.king:
-        seed_revision = ""
         try:
             seed_info = HfApi(token=HF_TOKEN or None).model_info(SEED_REPO)
             seed_revision = seed_info.sha
             log.info("seed king %s at revision %s", SEED_REPO, seed_revision[:12])
         except Exception:
-            log.warning("could not get seed king revision from %s", SEED_REPO)
-        state.set_king(wallet.hotkey.ss58_address, SEED_REPO, "seed",
-                       subtensor.block, king_revision=seed_revision)
+            log.error("could not resolve seed king revision from %s — refusing to start",
+                      SEED_REPO)
+            sys.exit(1)
+        state.set_king(wallet.hotkey.ss58_address, SEED_REPO, seed_revision,
+                       subtensor.block)
+
+    # Build (or load) the immutable seed fingerprint. This is the trust
+    # anchor for every structural check that follows.
+    try:
+        seed_fp = _load_seed_fingerprint(r2)
+    except Exception:
+        log.exception("FATAL: could not establish seed fingerprint")
+        sys.exit(1)
+
+    # Heal a poisoned king: walk back through previous_king links until we
+    # find one that still passes structural checks against the seed, or fall
+    # all the way back to the seed itself.
+    enforce_king_health(state, r2, wallet, subtensor, seed_fp)
+    last_king_health_check = time.time()
 
     maybe_set_weights(subtensor, wallet, state, force=True, reason="startup")
 
@@ -1167,6 +1338,18 @@ async def main():
                                   reason="periodic interval")
             except Exception:
                 log.exception("periodic weight-set failed")
+
+            # Periodic king health re-check. The structural fingerprint of a
+            # pinned revision can never change, but the king itself can be
+            # rotated mid-loop by an accept path; recompute and fall back if
+            # the new king turned out to be poisoned.
+            if time.time() - last_king_health_check >= KING_HEALTH_INTERVAL_S:
+                try:
+                    if enforce_king_health(state, r2, wallet, subtensor, seed_fp):
+                        log.info("king health enforcement triggered a revert")
+                except Exception:
+                    log.exception("periodic king health check failed")
+                last_king_health_check = time.time()
 
         except KeyboardInterrupt:
             break

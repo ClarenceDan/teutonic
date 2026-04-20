@@ -385,17 +385,28 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
 # ---------------------------------------------------------------------------
 
 NORM_EPSILON = 1e-8
+ZERO_FRAC_TOLERANCE = 0.001  # 0.1% extra exact-zeros over king => suspicious
 
 @torch.no_grad()
 def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
-    """Compare per-parameter L2 norms between king and challenger.
+    """Compare per-parameter weight statistics between king and challenger.
 
-    Returns (ok, violations) where violations is a list of dicts describing
-    each parameter that failed the check (non-finite values or norm ratio
-    exceeding max_ratio).
+    A challenger fails if any parameter:
+
+    * contains non-finite values, or
+    * has an L2 norm that diverges from the king's by more than ``max_ratio``
+      in EITHER direction (over- or under-scaled — both are equally
+      suspicious; an attacker can game eval just as easily by zeroing
+      activations as by exploding them), or
+    * introduces materially more exact-zero entries than the king
+      (typical signature of a hand-crafted "dead" subspace).
+
+    Returns ``(ok, violations)`` where ``violations`` is a list of dicts
+    describing each failing parameter.
     """
     king_params = dict(king_model.named_parameters())
     violations = []
+    inv_max_ratio = 1.0 / max_ratio
 
     for c_name, c_param in challenger_model.named_parameters():
         if not torch.isfinite(c_param.data).all():
@@ -406,20 +417,45 @@ def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
         if k_param is None:
             continue
 
-        k_norm = torch.linalg.vector_norm(k_param.data.float()).item()
-        c_norm = torch.linalg.vector_norm(c_param.data.float()).item()
+        k_data = k_param.data.float()
+        c_data = c_param.data.float()
+        k_norm = torch.linalg.vector_norm(k_data).item()
+        c_norm = torch.linalg.vector_norm(c_data).item()
 
         if k_norm < NORM_EPSILON:
+            # King param is itself ~zero; a small absolute change is fine,
+            # so we only flag very obvious blow-ups.
+            if c_norm > NORM_EPSILON * 1e3:
+                violations.append({
+                    "param": c_name,
+                    "reason": "exploded_from_zero_king",
+                    "king_norm": round(k_norm, 8),
+                    "challenger_norm": round(c_norm, 6),
+                })
             continue
 
         ratio = c_norm / k_norm
-        if ratio > max_ratio:
+        if ratio > max_ratio or ratio < inv_max_ratio:
             violations.append({
                 "param": c_name,
                 "reason": "norm_ratio",
                 "king_norm": round(k_norm, 6),
                 "challenger_norm": round(c_norm, 6),
                 "ratio": round(ratio, 4),
+            })
+            continue
+
+        numel = k_data.numel()
+        if numel == 0:
+            continue
+        k_zero_frac = (k_data == 0).float().mean().item()
+        c_zero_frac = (c_data == 0).float().mean().item()
+        if c_zero_frac - k_zero_frac > ZERO_FRAC_TOLERANCE:
+            violations.append({
+                "param": c_name,
+                "reason": "extra_exact_zeros",
+                "king_zero_frac": round(k_zero_frac, 6),
+                "challenger_zero_frac": round(c_zero_frac, 6),
             })
 
     return len(violations) == 0, violations

@@ -8,7 +8,6 @@
 5. Submits a reveal commitment on Bittensor chain
 """
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -82,16 +81,6 @@ def validate_local_config(king_dir: str, challenger_dir: str) -> str | None:
     return None
 
 
-def sha256_dir(path):
-    h = hashlib.sha256()
-    for p in sorted(Path(path).glob("*.safetensors")):
-        with open(p, "rb") as f:
-            while chunk := f.read(1 << 20):
-                h.update(chunk)
-    return h.hexdigest()
-
-
-
 def main():
     parser = argparse.ArgumentParser(description="Teutonic miner")
     parser.add_argument("--hotkey", default="h0", help="Wallet hotkey name")
@@ -127,7 +116,9 @@ def main():
     except Exception:
         log.warning("could not query metagraph — skipping registration check")
 
-    # Discover current king from dashboard
+    # Discover current king from dashboard. We REQUIRE a pinned revision —
+    # the validator will only ever evaluate against the exact king_revision
+    # we commit, so there is no point downloading anything else.
     king_repo = SEED_REPO
     king_revision = None
     dashboard = None
@@ -138,9 +129,17 @@ def main():
         king_repo = dashboard["king"]["hf_repo"]
         king_revision = dashboard["king"].get("king_revision") or None
         log.info("discovered king from dashboard: %s@%s",
-                 king_repo, king_revision[:12] if king_revision else "HEAD")
+                 king_repo, (king_revision or "?")[:12])
     except Exception:
         log.warning("could not fetch dashboard, falling back to seed repo %s", SEED_REPO)
+        try:
+            king_revision = HfApi(token=HF_TOKEN or None).model_info(SEED_REPO).sha
+        except Exception:
+            log.error("could not resolve seed king revision either — aborting")
+            sys.exit(1)
+    if not king_revision:
+        log.error("no king_revision available — aborting")
+        sys.exit(1)
 
     # Pre-flight: check if our hotkey is the current king
     if dashboard:
@@ -169,11 +168,9 @@ def main():
     king_dir = "/tmp/teutonic/miner/king"
     if os.path.exists(king_dir):
         shutil.rmtree(king_dir)
-    log.info("downloading king from %s@%s", king_repo, (king_revision or "HEAD")[:12])
+    log.info("downloading king from %s@%s", king_repo, king_revision[:12])
     snapshot_download(king_repo, local_dir=king_dir, token=HF_TOKEN or None,
                       revision=king_revision)
-    king_hash = sha256_dir(king_dir)
-    log.info("king hash: %s", king_hash[:16])
 
     # Create challenger by perturbing weights
     challenger_dir = f"/tmp/teutonic/miner/challenger-{suffix}"
@@ -196,9 +193,6 @@ def main():
                 new_sd[name] = tensor
         save_file(new_sd, str(st_file))
 
-    challenger_hash = sha256_dir(challenger_dir)
-    log.info("challenger hash: %s", challenger_hash[:16])
-
     # Pre-flight: validate challenger config matches king
     rejection = validate_local_config(king_dir, challenger_dir)
     if rejection:
@@ -218,8 +212,21 @@ def main():
     )
     log.info("uploaded to https://huggingface.co/%s", challenger_repo)
 
-    # Submit reveal commitment
-    payload = f"{king_hash[:16]}:{challenger_repo}:{challenger_hash}"
+    # Resolve the just-pushed git commit SHA. The validator will pin to this
+    # exact revision and refuse to follow any later push, so we MUST commit
+    # to the SHA we actually intend it to evaluate.
+    challenger_revision = api.model_info(challenger_repo).sha
+    log.info("challenger revision: %s", challenger_revision)
+
+    if not king_revision:
+        log.error("no pinned king_revision available — refusing to submit")
+        sys.exit(1)
+
+    # Submit reveal commitment.
+    # Payload schema v2: "<king_revision>:<challenger_repo>:<challenger_revision>"
+    # Both revisions are full 40-hex git SHAs; the validator strictly enforces
+    # this format and silently drops anything else.
+    payload = f"{king_revision}:{challenger_repo}:{challenger_revision}"
     log.info("submitting reveal: %s", payload)
 
     success, block = subtensor.set_reveal_commitment(
