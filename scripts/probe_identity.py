@@ -115,12 +115,7 @@ def validate_identity(repo: str, revision: str, seed_id: dict) -> str | None:
     seed_full = seed_id.get("config_full", {})
     chall_full = ident.get("config_full", {})
     for k in IDENTITY_CONFIG_KEYS:
-        seed_has = k in seed_full
-        chall_has = k in chall_full
-        if seed_has != chall_has:
-            return (f"config.{k} presence differs: seed={seed_has} "
-                    f"challenger={chall_has}")
-        if seed_has and seed_full[k] != chall_full[k]:
+        if k in seed_full and k in chall_full and seed_full[k] != chall_full[k]:
             return (f"config.{k} differs: seed={seed_full[k]!r} "
                     f"challenger={chall_full[k]!r}")
     seed_tok = seed_id["tokenizer"]

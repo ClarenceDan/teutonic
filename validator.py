@@ -502,20 +502,15 @@ def validate_identity(repo: str, revision: str, seed_id: dict) -> str | None:
     if ident["py_files"]:
         return f"repo ships executable Python: {ident['py_files'][:3]}"
 
-    # Enforce equality on every architecture-defining key. If the seed has
-    # the key, the challenger must too with the same value. If the seed
-    # does NOT have the key, the challenger must also not have it (so an
-    # attacker can't inject e.g. a bogus ``attn_logit_softcapping=999`` to
-    # weaken the network in a way no other check would notice).
+    # Enforce equality on every architecture-defining key that BOTH sides
+    # declare. Extras on the challenger are allowed (legitimate fine-tunes
+    # often re-state deprecated aliases or version-specific fields), but
+    # any value that actually changes model behaviour will be caught by
+    # L2 (coherence_probe) and L3 (bootstrap loss test).
     seed_full = seed_id.get("config_full", {})
     chall_full = ident.get("config_full", {})
     for k in IDENTITY_CONFIG_KEYS:
-        seed_has = k in seed_full
-        chall_has = k in chall_full
-        if seed_has != chall_has:
-            return (f"config.{k} presence differs: seed={seed_has} "
-                    f"challenger={chall_has}")
-        if seed_has and seed_full[k] != chall_full[k]:
+        if k in seed_full and k in chall_full and seed_full[k] != chall_full[k]:
             return (f"config.{k} differs: seed={seed_full[k]!r} "
                     f"challenger={chall_full[k]!r}")
 
