@@ -349,12 +349,21 @@ class R2:
 # ---------------------------------------------------------------------------
 
 IDENTITY_CONFIG_KEYS = (
+    # Core network shape
     "model_type", "architectures", "vocab_size", "hidden_size",
     "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "intermediate_size", "max_position_embeddings",
     "rope_theta", "rms_norm_eps",
+    # Activation & normalisation choices
+    "hidden_activation", "attention_bias", "initializer_range",
+    "attn_logit_softcapping", "final_logit_softcapping",
+    "use_bidirectional_attention", "query_pre_attn_scalar",
+    # Attention layout (sliding-window per-layer pattern)
+    "sliding_window", "sliding_window_pattern",
+    "_sliding_window_pattern", "layer_types",
     # tie_word_embeddings is intentionally NOT included: untying lm_head
-    # is a legitimate fine-tune trick.
+    # is a legitimate fine-tune trick; it's covered by the tensor-shape
+    # check via the (allowed) extra `lm_head.weight` tensor.
 )
 
 _seed_identity: dict | None = None
@@ -449,8 +458,13 @@ def compute_identity(repo: str, revision: str) -> dict:
 
     shapes = _safetensors_shapes(api, repo, revision, files)
 
+    # Store the full config separately so validate_identity can also reject
+    # adversarial keys the seed doesn't have. The IDENTITY_CONFIG_KEYS
+    # subset is what we *enforce* equality on; the full dict is what we
+    # compare against.
     identity = {
         "config": {k: cfg.get(k) for k in IDENTITY_CONFIG_KEYS if k in cfg},
+        "config_full": cfg,
         "tokenizer": tok_hashes,
         "shapes": shapes,
         "py_files": py_files,
@@ -488,10 +502,22 @@ def validate_identity(repo: str, revision: str, seed_id: dict) -> str | None:
     if ident["py_files"]:
         return f"repo ships executable Python: {ident['py_files'][:3]}"
 
-    for k, seed_val in seed_id["config"].items():
-        chall_val = ident["config"].get(k)
-        if seed_val != chall_val:
-            return f"config.{k} differs: seed={seed_val!r} challenger={chall_val!r}"
+    # Enforce equality on every architecture-defining key. If the seed has
+    # the key, the challenger must too with the same value. If the seed
+    # does NOT have the key, the challenger must also not have it (so an
+    # attacker can't inject e.g. a bogus ``attn_logit_softcapping=999`` to
+    # weaken the network in a way no other check would notice).
+    seed_full = seed_id.get("config_full", {})
+    chall_full = ident.get("config_full", {})
+    for k in IDENTITY_CONFIG_KEYS:
+        seed_has = k in seed_full
+        chall_has = k in chall_full
+        if seed_has != chall_has:
+            return (f"config.{k} presence differs: seed={seed_has} "
+                    f"challenger={chall_has}")
+        if seed_has and seed_full[k] != chall_full[k]:
+            return (f"config.{k} differs: seed={seed_full[k]!r} "
+                    f"challenger={chall_full[k]!r}")
 
     seed_tok = seed_id["tokenizer"]
     chall_tok = ident["tokenizer"]
