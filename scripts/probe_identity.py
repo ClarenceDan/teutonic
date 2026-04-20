@@ -42,6 +42,28 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
+_TOKENIZER_BENIGN_KEYS = frozenset({
+    "is_local", "transformers_version", "_commit_hash",
+    "tokenizer_file", "name_or_path", "auto_map",
+})
+
+
+def _canonical_tokenizer_hash(path: str) -> str:
+    if not path.endswith(".json"):
+        return _file_sha256(path)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return _file_sha256(path)
+    if isinstance(data, dict):
+        for k in _TOKENIZER_BENIGN_KEYS:
+            data.pop(k, None)
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _safetensors_shapes(api: HfApi, repo: str, revision: str,
                         files: list[str]) -> dict[str, list[int]]:
     shapes: dict[str, list[int]] = {}
@@ -91,7 +113,7 @@ def compute_identity(repo: str, revision: str) -> dict:
     for tf in tok_files:
         local = api.hf_hub_download(repo, tf, token=HF_TOKEN or None,
                                     revision=revision)
-        tok_hashes[tf] = _file_sha256(local)
+        tok_hashes[tf] = _canonical_tokenizer_hash(local)
 
     shapes = _safetensors_shapes(api, repo, revision, files)
     return {

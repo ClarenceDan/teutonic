@@ -385,6 +385,37 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
+# Metadata fields that some HF save paths flip without changing the
+# tokenizer's actual behaviour. Stripping them before hashing avoids
+# false positives on legitimate fine-tune-then-upload workflows.
+_TOKENIZER_BENIGN_KEYS = frozenset({
+    "is_local",
+    "transformers_version",
+    "_commit_hash",
+    "tokenizer_file",  # absolute local path baked in by some save paths
+    "name_or_path",    # original load path
+    "auto_map",        # already rejected at config level
+})
+
+
+def _canonical_tokenizer_hash(path: str) -> str:
+    """Hash a tokenizer file ignoring HF metadata that depends only on
+    HOW it was saved/loaded, not WHAT it tokenises to."""
+    if not path.endswith(".json"):
+        return _file_sha256(path)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return _file_sha256(path)
+    if isinstance(data, dict):
+        for k in _TOKENIZER_BENIGN_KEYS:
+            data.pop(k, None)
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _safetensors_shapes(api: HfApi, repo: str, revision: str,
                         files: list[str]) -> dict[str, list[int]]:
     """Return ``{tensor_name: shape}`` for every tensor in the repo.
@@ -454,7 +485,7 @@ def compute_identity(repo: str, revision: str) -> dict:
     for tf in tok_files:
         local = api.hf_hub_download(repo, tf, token=HF_TOKEN or None,
                                     revision=revision)
-        tok_hashes[tf] = _file_sha256(local)
+        tok_hashes[tf] = _canonical_tokenizer_hash(local)
 
     shapes = _safetensors_shapes(api, repo, revision, files)
 
