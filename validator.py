@@ -31,6 +31,11 @@ from safetensors import safe_open
 EVAL_N = 20_000
 EVAL_ALPHA = 0.001
 EVAL_DELTA = float(os.environ.get("TEUTONIC_EVAL_DELTA", "0.01"))
+# Number of independent shards to draw per eval. The bootstrap LCB is
+# computed on the *pooled* per-token diffs across all K shards. A
+# memorization / shard-overfit attack must now succeed on K independent
+# random shards simultaneously, which is exponentially harder than on one.
+EVAL_NUM_SHARDS = int(os.environ.get("TEUTONIC_NUM_SHARDS", "3"))
 SEQ_LEN = 2048
 POLL_INTERVAL = 30
 WEIGHT_INTERVAL = 300
@@ -1011,9 +1016,24 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         state.flush()
         return
     n_shards = manifest["total_shards"]
+    # Pick K independent shard indices from one seed by hashing with distinct
+    # personalisations. Same (block_hash, hotkey) -> same K shards, so the
+    # eval is reproducible; but the miner cannot pre-overfit because they
+    # do not know block_hash until reveal.
     seed_mat = f"{block_hash}:{hotkey}".encode()
-    shard_idx = int.from_bytes(hashlib.blake2b(seed_mat, digest_size=8).digest(), "little") % n_shards
-    shard_key = manifest["shards"][shard_idx]["key"]
+    k = max(1, min(EVAL_NUM_SHARDS, n_shards))
+    shard_keys: list[str] = []
+    seen_idx: set[int] = set()
+    salt = 0
+    while len(shard_keys) < k:
+        h = hashlib.blake2b(seed_mat, digest_size=8,
+                             person=f"shard{salt:02d}".encode())
+        idx = int.from_bytes(h.digest(), "little") % n_shards
+        salt += 1
+        if idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        shard_keys.append(manifest["shards"][idx]["key"])
 
     king_repo = state.king.get("hf_repo", SEED_REPO)
     king_revision = state.king.get("king_revision", "")
@@ -1023,7 +1043,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         "king_revision": king_revision,
         "challenger_repo": hf_repo, "challenger_revision": challenger_revision,
         "hotkey": hotkey,
-        "N": EVAL_N, "alpha": EVAL_ALPHA, "delta": EVAL_DELTA, "shard": shard_key,
+        "N": EVAL_N, "alpha": EVAL_ALPHA, "delta": EVAL_DELTA,
+        "shards": shard_keys,
         "eval_block": eval_block, "block_hash": block_hash,
     })
 
@@ -1042,7 +1063,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             "challenger_repo": hf_repo,
             "block_hash": block_hash,
             "hotkey": hotkey,
-            "shard_key": shard_key,
+            "shard_keys": shard_keys,
             "king_revision": king_revision,
             "challenger_revision": challenger_revision,
             "eval_n": EVAL_N,

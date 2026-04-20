@@ -91,7 +91,7 @@ class EvalRequest(BaseModel):
     challenger_repo: str
     block_hash: str
     hotkey: str
-    shard_key: str
+    shard_keys: list[str]
     king_revision: str
     challenger_revision: str
     eval_n: int = DEFAULT_EVAL_N
@@ -306,7 +306,7 @@ def _run_eval(eval_id: str, req: EvalRequest):
 
         verdict = run_bootstrap_test(
             king_eval, challenger_eval,
-            _r2, req.shard_key, req.eval_n, req.alpha, req.delta,
+            _r2, req.shard_keys, req.eval_n, req.alpha, req.delta,
             req.seq_len, req.batch_size, seed_str,
             n_bootstrap=req.n_bootstrap,
             on_progress=_on_progress,

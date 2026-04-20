@@ -569,87 +569,106 @@ def compute_paired_multi_gpu(king_eval, chall_eval, token_batches):
 # Bootstrap test
 # ---------------------------------------------------------------------------
 
-def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
+def run_bootstrap_test(king_eval, challenger_eval, r2, shard_keys, eval_n,
                        alpha, delta, seq_len, batch_size, seed_str,
                        n_bootstrap=10000, on_progress=None):
-    """Paired bootstrap test on per-token log-loss differences.
+    """Paired bootstrap LCB across K independent shards.
 
-    Scores M fixed-length blocks on both models, computes d_i = king_loss_i -
-    challenger_loss_i (positive means challenger is better), then bootstraps the
-    mean to get a one-sided lower confidence bound (LCB).  Accepts only if
-    LCB > delta.
+    For K = len(shard_keys), draws ~eval_n / K sequences from each shard
+    (deterministic from seed_str + shard index), computes per-token
+    diff = king_loss - challenger_loss, and POOLS the diffs across shards
+    before bootstrapping. A challenger that overfits one shard is now
+    diluted by K-1 shards it never saw and cannot win the pool.
 
-    Calls on_progress(info_dict) after each batch if provided.
+    Backwards-compat: ``shard_keys`` may also be a single string for
+    one-off CLI invocations.
     """
-    n_tokens = get_shard_info(r2, shard_key)
-    n_sequences = n_tokens // seq_len
-    actual_N = min(eval_n, n_sequences)
-    log.info("bootstrap test: N=%d actual_N=%d alpha=%s delta=%.6f B=%d",
-             eval_n, actual_N, alpha, delta, n_bootstrap)
+    if isinstance(shard_keys, str):
+        shard_keys = [shard_keys]
+    if not shard_keys:
+        raise ValueError("at least one shard_key required")
 
-    seed_material = seed_str.encode()
-    seed = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), "little")
-    rng = np.random.Generator(np.random.PCG64(seed))
-    eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+    k = len(shard_keys)
+    per_shard_n = max(1, eval_n // k)
+    log.info("bootstrap test: K=%d shards, per_shard_n=%d, alpha=%s delta=%.6f B=%d",
+             k, per_shard_n, alpha, delta, n_bootstrap)
 
-    log.info("downloading shard %s ...", shard_key)
-    data_offset, shard_data = download_shard(r2, shard_key)
-
-    log.info("extracting %d sequences", actual_N)
-    seq_cache = extract_sequences(shard_data, data_offset, eval_indices, seq_len)
-    log.info("extracted %d sequences", len(seq_cache))
-
-    batches = [
-        eval_indices[i : i + batch_size]
-        for i in range(0, len(eval_indices), batch_size)
-    ]
-
-    all_diffs = []
-    king_sum, chall_sum = 0.0, 0.0
-    total_done = 0
-    t0 = time.time()
+    base_seed = int.from_bytes(
+        hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little"
+    )
 
     same_evaluator = king_eval is challenger_eval
+    all_diffs: list[float] = []
+    king_sum = 0.0
+    chall_sum = 0.0
+    total_done = 0
+    target_total = 0
+    t0 = time.time()
 
-    for bi, batch_indices in enumerate(batches):
-        token_batches = [seq_cache[idx] for idx in batch_indices]
+    for shard_idx, shard_key in enumerate(shard_keys):
+        n_tokens = get_shard_info(r2, shard_key)
+        n_sequences = n_tokens // seq_len
+        actual_N = min(per_shard_n, n_sequences)
+        target_total += actual_N
 
-        if same_evaluator:
-            king_losses = king_eval.compute_losses(token_batches)
-            chall_losses = king_losses
-        else:
-            king_losses, chall_losses = compute_paired_multi_gpu(
-                king_eval, challenger_eval, token_batches,
+        shard_seed = base_seed ^ (0xA5A5A5A5 * (shard_idx + 1))
+        rng = np.random.Generator(np.random.PCG64(shard_seed))
+        eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+
+        log.info("shard %d/%d %s: downloading & extracting %d sequences",
+                 shard_idx + 1, k, shard_key, actual_N)
+        data_offset, shard_data = download_shard(r2, shard_key)
+        seq_cache = extract_sequences(shard_data, data_offset, eval_indices, seq_len)
+
+        batches = [
+            eval_indices[i : i + batch_size]
+            for i in range(0, len(eval_indices), batch_size)
+        ]
+
+        for bi, batch_indices in enumerate(batches):
+            token_batches = [seq_cache[idx] for idx in batch_indices]
+
+            if same_evaluator:
+                king_losses = king_eval.compute_losses(token_batches)
+                chall_losses = king_losses
+            else:
+                king_losses, chall_losses = compute_paired_multi_gpu(
+                    king_eval, challenger_eval, token_batches,
+                )
+
+            for k_loss, c_loss in zip(king_losses, chall_losses):
+                total_done += 1
+                king_sum += k_loss
+                chall_sum += c_loss
+                all_diffs.append(k_loss - c_loss)
+
+            elapsed = time.time() - t0
+            seqs_per_sec = total_done / elapsed if elapsed > 0 else 0
+            mu_hat = float(np.mean(all_diffs)) if all_diffs else 0.0
+            log.info(
+                "shard %d/%d batch %d/%d | done=%d/%d | mu_hat=%.6f | %.1f seq/s",
+                shard_idx + 1, k, bi + 1, len(batches),
+                total_done, target_total, mu_hat, seqs_per_sec,
             )
 
-        for k_loss, c_loss in zip(king_losses, chall_losses):
-            total_done += 1
-            king_sum += k_loss
-            chall_sum += c_loss
-            all_diffs.append(k_loss - c_loss)
+            if on_progress:
+                on_progress({
+                    "done": total_done, "total": target_total,
+                    "mu_hat": round(float(mu_hat), 6),
+                    "avg_king_loss": round(king_sum / total_done, 6),
+                    "avg_challenger_loss": round(chall_sum / total_done, 6),
+                    "seqs_per_sec": round(seqs_per_sec, 1),
+                    "shard_index": shard_idx + 1,
+                    "shard_count": k,
+                })
 
-        elapsed = time.time() - t0
-        seqs_per_sec = total_done / elapsed if elapsed > 0 else 0
-        mu_hat = np.mean(all_diffs) if all_diffs else 0.0
-        log.info(
-            "batch %d/%d | done=%d/%d | mu_hat=%.6f | %.1f seq/s",
-            bi + 1, len(batches), total_done, actual_N, mu_hat, seqs_per_sec,
-        )
-
-        if on_progress:
-            on_progress({
-                "done": total_done, "total": actual_N,
-                "mu_hat": round(float(mu_hat), 6),
-                "avg_king_loss": round(king_sum / total_done, 6),
-                "avg_challenger_loss": round(chall_sum / total_done, 6),
-                "seqs_per_sec": round(seqs_per_sec, 1),
-            })
+        del shard_data, seq_cache
 
     elapsed = time.time() - t0
     d = np.array(all_diffs)
     mu_hat = float(d.mean())
 
-    boot_rng = np.random.Generator(np.random.PCG64(seed ^ 0xB007))
+    boot_rng = np.random.Generator(np.random.PCG64(base_seed ^ 0xB007))
     boot_means = np.empty(n_bootstrap)
     for b in range(n_bootstrap):
         idx = boot_rng.integers(0, len(d), size=len(d))
@@ -657,8 +676,8 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
     lcb = float(np.quantile(boot_means, alpha))
 
     accepted = lcb > delta
-    log.info("bootstrap result: mu_hat=%.6f lcb=%.6f delta=%.6f accepted=%s",
-             mu_hat, lcb, delta, accepted)
+    log.info("bootstrap result: K=%d N=%d mu_hat=%.6f lcb=%.6f delta=%.6f accepted=%s",
+             k, total_done, mu_hat, lcb, delta, accepted)
 
     verdict = {
         "accepted": accepted,
@@ -668,7 +687,9 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
         "delta": delta,
         "alpha": alpha,
         "n_bootstrap": n_bootstrap,
-        "N": actual_N,
+        "N": total_done,
+        "K_shards": k,
+        "shards": list(shard_keys),
         "avg_king_loss": round(king_sum / total_done, 6) if total_done else 0,
         "avg_challenger_loss": round(chall_sum / total_done, 6) if total_done else 0,
         "wall_time_s": round(elapsed, 1),
