@@ -352,7 +352,9 @@ IDENTITY_CONFIG_KEYS = (
     "model_type", "architectures", "vocab_size", "hidden_size",
     "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "intermediate_size", "max_position_embeddings",
-    "rope_theta", "rms_norm_eps", "tie_word_embeddings",
+    "rope_theta", "rms_norm_eps",
+    # tie_word_embeddings is intentionally NOT included: untying lm_head
+    # is a legitimate fine-tune trick.
 )
 
 _seed_identity: dict | None = None
@@ -502,11 +504,15 @@ def validate_identity(repo: str, revision: str, seed_id: dict) -> str | None:
 
     seed_shapes = seed_id["shapes"]
     chall_shapes = ident["shapes"]
-    extra = sorted(set(chall_shapes) - set(seed_shapes))
+    # Every tensor in the seed must be present in the challenger with the
+    # same shape, so the model can be loaded under the seed config and run
+    # the same forward pass. We allow extra tensors (e.g. an untied
+    # lm_head, or fine-tune-introduced q_norm/k_norm layernorms): they
+    # are either silently ignored by the loader or, if active, bounded by
+    # the behavioral coherence probe and the bootstrap LCB downstream.
     missing = sorted(set(seed_shapes) - set(chall_shapes))
-    if extra or missing:
-        return (f"tensor name set differs (extra={extra[:3]} "
-                f"missing={missing[:3]})")
+    if missing:
+        return f"missing tensors from seed: {missing[:3]}"
     for name, shape in seed_shapes.items():
         if chall_shapes[name] != shape:
             return (f"{name} shape differs: seed={shape} "
