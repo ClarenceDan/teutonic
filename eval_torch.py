@@ -117,7 +117,13 @@ class R2:
 # ---------------------------------------------------------------------------
 
 def get_shard_info(r2, shard_key):
-    header = r2.ds_range_get(shard_key, 0, 1023)
+    # Try local cache first to avoid network round-trip
+    cache_name = shard_key.replace("/", "_")
+    cache_path = pathlib.Path(SHARD_CACHE_DIR) / cache_name
+    if cache_path.exists():
+        header = cache_path.read_bytes()[:1024]
+    else:
+        header = r2.ds_range_get(shard_key, 0, 1023)
     buf = io.BytesIO(header)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
@@ -132,7 +138,12 @@ def get_shard_info(r2, shard_key):
 R2_FETCH_WORKERS = 32
 
 def _parse_shard_header(r2, shard_key):
-    header = r2.ds_range_get(shard_key, 0, 1023)
+    cache_name = shard_key.replace("/", "_")
+    cache_path = pathlib.Path(SHARD_CACHE_DIR) / cache_name
+    if cache_path.exists():
+        header = cache_path.read_bytes()[:1024]
+    else:
+        header = r2.ds_range_get(shard_key, 0, 1023)
     buf = io.BytesIO(header)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
