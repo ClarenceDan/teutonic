@@ -81,11 +81,17 @@ def weight_delta_audit(seed: dict, miners: dict[str, dict]) -> None:
             shared += 1
         extra = len(sd) - shared
         all_d = torch.cat(diffs)
+        # torch.quantile caps at ~16M; subsample for percentiles
+        if all_d.numel() > 5_000_000:
+            idx = torch.randint(0, all_d.numel(), (5_000_000,))
+            sample = all_d[idx]
+        else:
+            sample = all_d
         rel = (rel_num / max(rel_den, 1e-30)) ** 0.5
         print("{:<42} {:>11.4e} {:>10.4e} {:>10.4e} {:>10.4e} "
               "{:>10.4e} {:>8d} {:>7d}".format(
-                  name, all_d.mean().item(), all_d.median().item(),
-                  all_d.quantile(0.99).item(), all_d.max().item(),
+                  name, all_d.mean().item(), sample.median().item(),
+                  sample.quantile(0.99).item(), all_d.max().item(),
                   rel, shared, extra))
 
     # Top-5 most-perturbed tensors per miner
